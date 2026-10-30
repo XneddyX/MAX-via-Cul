@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import socket
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -79,6 +80,7 @@ _LOGGER = logging.getLogger(__name__)
 
 RECONNECT_DELAY_MIN = 5   # seconds before first reconnect attempt
 RECONNECT_DELAY_MAX = 60  # upper bound for exponential backoff
+CONNECTION_HEALTH_INTERVAL = 10.0  # seconds between connection health checks
 ACK_TIMEOUT = 3.0
 ACK_RETRIES = 2
 SET_TEMPERATURE_ACK_TIMEOUT = 5.0
@@ -337,11 +339,13 @@ class CulMaxCoordinator:
         host: str,
         port: int = DEFAULT_PORT,
         own_address: int = DEFAULT_OWN_ADDRESS,
+        config_entry_id: str | None = None,
     ) -> None:
         self.hass = hass
         self.host = host
         self.port = port
         self.own_address = own_address
+        self._config_entry_id = config_entry_id
 
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
@@ -356,6 +360,7 @@ class CulMaxCoordinator:
         self._polling_task: asyncio.Task | None = None
         self._startup_time_sync_task: asyncio.Task | None = None
         self._pending_queue_task: asyncio.Task | None = None
+        self._health_check_task: asyncio.Task | None = None
         self._auto_mode_time_sync_tasks: dict[str, asyncio.Task] = {}
         self._command_queue: asyncio.Queue[CommandRequest] = asyncio.Queue()
         self._command_worker_task: asyncio.Task | None = None
@@ -383,6 +388,8 @@ class CulMaxCoordinator:
         self._diagnostic_listeners: dict[str, list[Callable[[], None]]] = {}
         # Integration-wide pairing listeners: [callback()]
         self._pairing_state_listeners: list[Callable[[], None]] = []
+        # Integration-wide connection listeners: [callback()]
+        self._connection_listeners: list[Callable[[], None]] = []
 
     def _migrate_storage_data(self, data: Any) -> tuple[dict[str, Any], bool]:
         """Migrate stored integration data to the current explicit schema."""
@@ -491,7 +498,9 @@ class CulMaxCoordinator:
         if device is None:
             return
         registry = dr.async_get(self.hass)
-        entry = registry.async_get_device(identifiers={(DOMAIN, normalized)})
+        entry = registry.async_get_device_by_identifier(
+            (DOMAIN, normalized), self._config_entry_id
+        )
         if entry is None:
             return
         desired_model = self.get_device_registry_model(device)
@@ -889,6 +898,11 @@ class CulMaxCoordinator:
             self._polling_task = self.hass.loop.create_task(self._periodic_time_sync_loop())
         if self._pending_queue_task is None or self._pending_queue_task.done():
             self._pending_queue_task = self.hass.loop.create_task(self._pending_queue_maintenance_loop())
+        if self._health_check_task is None or self._health_check_task.done():
+            _LOGGER.warning("Creating connection health check task")
+            self._health_check_task = self.hass.loop.create_task(self._connection_health_check_loop())
+        else:
+            _LOGGER.warning("Health check task already exists: %s", self._health_check_task)
         await self._load_devices()
         await self._ensure_time_slots_assigned()
         if await self._connect():
@@ -917,6 +931,12 @@ class CulMaxCoordinator:
             self._pending_queue_task.cancel()
             try:
                 await self._pending_queue_task
+            except asyncio.CancelledError:
+                pass
+        if self._health_check_task:
+            self._health_check_task.cancel()
+            try:
+                await self._health_check_task
             except asyncio.CancelledError:
                 pass
         for task in self._auto_mode_time_sync_tasks.values():
@@ -979,12 +999,26 @@ class CulMaxCoordinator:
                 asyncio.open_connection(self.host, self.port),
                 timeout=10.0,
             )
+            # Enable TCP keepalive so the OS detects a dead peer promptly
+            sock = self._writer.get_extra_info("socket")
+            if sock is not None:
+                try:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                    if hasattr(socket, "TCP_KEEPIDLE"):
+                        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 15)
+                    if hasattr(socket, "TCP_KEEPINTVL"):
+                        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5)
+                    if hasattr(socket, "TCP_KEEPCNT"):
+                        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+                except OSError as e:
+                    _LOGGER.debug("Could not set TCP keepalive options: %s", e)
             self._reconnect_delay = RECONNECT_DELAY_MIN
             self._cul_credit_estimate = CUL_CREDIT_MAX
             self._cul_credit_updated_at = self.hass.loop.time()
             _LOGGER.info("Connected to CULFW at %s:%d", self.host, self.port)
         except (OSError, asyncio.TimeoutError) as e:
             _LOGGER.error("Cannot connect to CULFW at %s:%d — %s", self.host, self.port, e)
+            self._notify_connection_updated()
             return False
 
         # Init sequence mirrors the effective MAX!/Moritz setup used here: Zr
@@ -997,9 +1031,11 @@ class CulMaxCoordinator:
         except (ConnectionError, OSError) as e:
             _LOGGER.warning("CULFW init sequence failed at %s:%d: %s", self.host, self.port, e)
             await self._close_connection()
+            self._notify_connection_updated()
             return False
 
         self._read_task = self.hass.loop.create_task(self._read_loop())
+        self._notify_connection_updated()
         return True
 
     async def _close_connection(self) -> None:
@@ -1010,7 +1046,9 @@ class CulMaxCoordinator:
         if writer is not None:
             writer.close()
             try:
-                await writer.wait_closed()
+                await asyncio.wait_for(writer.wait_closed(), timeout=5.0)
+            except asyncio.TimeoutError:
+                _LOGGER.warning("Socket close timed out for %s:%d", self.host, self.port)
             except (ConnectionError, OSError, RuntimeError) as err:
                 _LOGGER.debug("Ignoring socket-close error for %s:%d: %s", self.host, self.port, err)
 
@@ -1027,7 +1065,11 @@ class CulMaxCoordinator:
         _LOGGER.debug("CUL read loop started")
         try:
             while True:
-                line_bytes = await self._reader.readline()
+                try:
+                    line_bytes = await asyncio.wait_for(self._reader.readline(), timeout=30.0)
+                except asyncio.TimeoutError:
+                    _LOGGER.warning("CULFW readline timeout — connection may be dead")
+                    break
                 if not line_bytes:
                     _LOGGER.warning("CULFW connection closed by remote host")
                     break
@@ -1047,6 +1089,7 @@ class CulMaxCoordinator:
 
         # Connection lost — try to reconnect
         await self._close_connection()
+        self._notify_connection_updated()
         self._schedule_reconnect()
 
     async def _reconnect_loop(self) -> None:
@@ -1339,6 +1382,18 @@ class CulMaxCoordinator:
             self._pairing_task.cancel()
         self._notify_pairing_state_updated()
         self._pairing_task = self.hass.loop.create_task(self._pairing_timeout(duration))
+
+    async def async_stop_pairing(self) -> None:
+        """Exit pairing mode immediately."""
+        if not self._pairing_mode:
+            return
+        _LOGGER.info("MAX! pairing mode stopped early")
+        self._pairing_mode = False
+        self._pairing_until = None
+        if self._pairing_task:
+            self._pairing_task.cancel()
+            self._pairing_task = None
+        self._notify_pairing_state_updated()
 
     async def _pairing_timeout(self, duration: int) -> None:
         await asyncio.sleep(duration)
@@ -2192,6 +2247,22 @@ class CulMaxCoordinator:
         del self._devices[address.upper()]
         await self._save_devices()
         _LOGGER.info("Deleted virtual device %s", self._format_device_identity(address))
+
+    async def async_delete_device(self, address: str) -> None:
+        """Delete any persisted MAX! device (physical or virtual) from the integration.
+
+        Removes the device from the internal store and persists the change.
+        Device registry entries are left to Home Assistant's device registry
+        cleanup (orphaned devices are removed on next restart or via
+        cleanup_superseded_devices).
+        """
+        normalized = address.upper()
+        device = self.get_device(normalized)
+        if device is None:
+            raise ValueError(f"Unbekannte Geraeteadresse {address}")
+        del self._devices[normalized]
+        await self._save_devices()
+        _LOGGER.info("Deleted device %s", self._format_device_identity(normalized))
 
     async def async_send_virtual_shutter_contact_state(
         self,
@@ -3211,6 +3282,54 @@ class CulMaxCoordinator:
         except asyncio.CancelledError:
             return
 
+    async def _connection_health_check_loop(self) -> None:
+        """Periodically verify the TCP connection is still alive.
+
+        When idle, ``_read_loop`` is blocked on ``readline()`` and the TCP
+        stack may not immediately detect a cable pull. This loop actively
+        probes the connection so the connection status sensor updates
+        promptly when the CULFW device becomes unreachable.
+        """
+        _LOGGER.warning("Connection health check loop started (interval=%.0fs)", CONNECTION_HEALTH_INTERVAL)
+        try:
+            while True:
+                if self._shutting_down or self._reconnecting:
+                    await asyncio.sleep(CONNECTION_HEALTH_INTERVAL)
+                    continue
+                if self._writer is None:
+                    _LOGGER.warning("Health check: writer is None, connection appears disconnected")
+                    self._notify_connection_updated()
+                    await asyncio.sleep(CONNECTION_HEALTH_INTERVAL)
+                    continue
+                _LOGGER.debug("Health check: probing connection to %s:%d", self.host, self.port)
+                try:
+                    # Send a real CULFW version probe to force the TCP stack
+                    # to detect a dead peer. A zero-byte write would not
+                    # traverse the network and thus would not detect a cable pull.
+                    self._writer.write(CULFW_CMD_VERSION.encode("ascii"))
+                    await self._writer.drain()
+                    # Also check the socket error directly to catch a dead peer
+                    # even when the write buffer hasn't flushed yet.
+                    sock = self._writer.get_extra_info("socket")
+                    if sock is not None:
+                        try:
+                            err = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+                            if err != 0:
+                                raise OSError(err, f"Socket error: {err}")
+                        except OSError as e:
+                            _LOGGER.warning("Health check socket error: %s", e)
+                            raise
+                    _LOGGER.debug("Health check: connection OK")
+                except (BrokenPipeError, ConnectionResetError, OSError) as e:
+                    _LOGGER.warning("Connection health check failed: %s", e)
+                    await self._close_connection()
+                    self._notify_connection_updated()
+                    self._schedule_reconnect()
+                await asyncio.sleep(CONNECTION_HEALTH_INTERVAL)
+        except asyncio.CancelledError:
+            _LOGGER.warning("Connection health check loop cancelled")
+            return
+
     def _schedule_startup_time_sync(self) -> None:
         """Schedule one staggered startup time sync for paired climate devices."""
         if self._startup_time_sync_task and not self._startup_time_sync_task.done():
@@ -3534,6 +3653,7 @@ class CulMaxCoordinator:
             except (BrokenPipeError, ConnectionResetError, OSError) as e:
                 _LOGGER.warning("CULFW send failed: %s", e)
                 await self._close_connection()
+                self._notify_connection_updated()
                 self._schedule_reconnect()
                 raise
 
@@ -4151,6 +4271,27 @@ class CulMaxCoordinator:
         return remove
 
     @callback
+    def add_connection_listener(self, cb: Callable[[], None]) -> Callable:
+        """Register a callback for TCP connection state changes."""
+        self._connection_listeners.append(cb)
+
+        def remove() -> None:
+            self._connection_listeners.remove(cb)
+
+        return remove
+
+    @callback
+    def _notify_connection_updated(self) -> None:
+        """Notify listeners that the TCP connection state changed."""
+        _LOGGER.warning(
+            "_notify_connection_updated called: is_connected=%s, listeners=%d",
+            self.is_connected,
+            len(self._connection_listeners),
+        )
+        for cb in self._connection_listeners:
+            self.hass.loop.call_soon(cb)
+
+    @callback
     def _notify_diagnostics_updated(self, address: str) -> None:
         """Notify listeners that diagnostic data for a device changed."""
         addr = address.upper()
@@ -4187,6 +4328,11 @@ class CulMaxCoordinator:
     def is_pairing_mode(self) -> bool:
         """Return whether the integration is currently in pairing mode."""
         return self._pairing_mode
+
+    @property
+    def is_connected(self) -> bool:
+        """Return whether the TCP connection to the CULFW device is currently open."""
+        return self._writer is not None
 
     @property
     def pairing_until(self) -> datetime | None:

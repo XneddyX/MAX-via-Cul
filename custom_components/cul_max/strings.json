@@ -437,6 +437,24 @@
         }
       }
     },
+    "delete_device": {
+      "name": "Gerät löschen",
+      "description": "Löscht ein MAX!-Gerät (physisch oder virtuell) aus der Integration.",
+      "fields": {
+        "address": {
+          "name": "Adresse",
+          "description": "6-stellige Hex-Adresse des Geräts (z.B. 1A2B3C)"
+        },
+        "entity_id": {
+          "name": "Geraet",
+          "description": "Alternativ ein MAX!-Entity direkt auswählen"
+        },
+        "device_name": {
+          "name": "Geraetename",
+          "description": "Alternativ den gespeicherten MAX!-Geraetenamen angeben"
+        }
+      }
+    },
     "send_virtual_shutter_contact_state": {
       "name": "Virtuellen Fensterkontakt senden",
       "description": "Sendet den Status eines virtuellen MAX!-Fensterkontakts. Bei gesetzter Gruppen-ID wirkt das Telegramm auf die zugeordneten Geräte derselben Gruppe und kann z.B. aus IKEA-Zigbee-Automationen aufgerufen werden.",

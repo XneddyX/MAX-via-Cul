@@ -63,6 +63,7 @@ SERVICE_NAMES: tuple[str, ...] = (
     "deassociate_devices",
     "create_virtual_shutter_contact",
     "delete_virtual_device",
+    "delete_device",
     "send_virtual_shutter_contact_state",
     "create_room_association",
     "delete_room_association",
@@ -309,6 +310,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: CulMaxConfigEntry) -> bo
         host=host,
         port=port,
         own_address=own_address,
+        config_entry_id=entry.entry_id,
     )
 
     if not await coordinator.async_setup():
@@ -319,6 +321,62 @@ async def async_setup_entry(hass: HomeAssistant, entry: CulMaxConfigEntry) -> bo
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     _register_services(hass, coordinator)
     return True
+
+
+async def async_remove_config_entry_device(
+    hass: HomeAssistant,
+    config_entry: CulMaxConfigEntry,
+    device_entry: dr.DeviceEntry,
+) -> bool:
+    """Remove a MAX! device when the user deletes it from the device menu (three dots).
+
+    Home Assistant calls this when a user removes a device via the device registry
+    UI. We look up the MAX! address from the device identifiers and delete it from
+    the coordinator's internal store.
+
+    The CUL controller device itself (``CONTROLLER_<host>:<port>``) cannot be
+    removed this way — it is tied to the config entry and removed only when the
+    integration is uninstalled.
+    """
+    coordinator: CulMaxCoordinator = config_entry.runtime_data
+    if coordinator is None:
+        return False
+
+    # Find the MAX! address from the device registry identifiers
+    for identifier in device_entry.identifiers:
+        if len(identifier) == 2 and identifier[0] == DOMAIN:
+            address = str(identifier[1]).upper()
+
+            # The CUL controller device cannot be removed via the device menu
+            if address.startswith("CONTROLLER_"):
+                _LOGGER.warning(
+                    "Refusing to remove CUL controller device %s via device menu. "
+                    "Remove the integration instead to delete the controller.",
+                    address,
+                )
+                return False
+
+            device = coordinator.get_device(address)
+            if device is not None:
+                try:
+                    await coordinator.async_delete_device(address)
+                    _LOGGER.info(
+                        "Removed MAX! device %s via device menu",
+                        coordinator._format_device_identity(address),
+                    )
+                    return True
+                except ValueError as err:
+                    _LOGGER.warning(
+                        "Could not remove MAX! device %s: %s", address, err
+                    )
+                    return False
+
+    _LOGGER.warning(
+        "No MAX! device found for device entry %s (%s)",
+        device_entry.id,
+        device_entry.name,
+    )
+    return False
 
 
 def _register_services(hass: HomeAssistant, coordinator: CulMaxCoordinator) -> None:
@@ -718,6 +776,17 @@ def _register_services(hass: HomeAssistant, coordinator: CulMaxCoordinator) -> N
         await coordinator.async_delete_virtual_device(address)
         return {"device": device_info}
 
+    async def handle_delete_device(call: ServiceCall) -> dict[str, object] | None:
+        address = _resolve_device_address(hass, call)
+        if address is None and call.data.get("device_name"):
+            address = _resolve_device_address_from_name(coordinator, str(call.data["device_name"]))
+        if address is None:
+            _LOGGER.error("delete_device: missing address, entity_id or device_name")
+            return
+        device_info = _device_payload(address)
+        await coordinator.async_delete_device(address)
+        return {"device": device_info}
+
     async def handle_send_virtual_shutter_contact_state(call: ServiceCall) -> dict[str, object] | None:
         address = _resolve_device_address(hass, call)
         if address is None and call.data.get("device_name"):
@@ -1090,7 +1159,9 @@ def _register_services(hass: HomeAssistant, coordinator: CulMaxCoordinator) -> N
 
             removed_device_addresses: list[str] = []
             for address in removable_addresses:
-                device_entry = device_registry.async_get_device(identifiers={(DOMAIN, address)})
+                device_entry = device_registry.async_get_device_by_identifier(
+                    (DOMAIN, address), coordinator._config_entry_id
+                )
                 if device_entry is not None:
                     device_registry.async_remove_device(device_entry.id)
                     removed_device_addresses.append(address)
@@ -1288,6 +1359,16 @@ def _register_services(hass: HomeAssistant, coordinator: CulMaxCoordinator) -> N
     _register(
         "delete_virtual_device",
         handle_delete_virtual_device,
+        schema=vol.Schema({
+            vol.Optional("address"): cv.string,
+            vol.Optional("entity_id"): cv.entity_id,
+            vol.Optional("device_name"): cv.string,
+        }),
+        supports_response=SupportsResponse.OPTIONAL,
+    )
+    _register(
+        "delete_device",
+        handle_delete_device,
         schema=vol.Schema({
             vol.Optional("address"): cv.string,
             vol.Optional("entity_id"): cv.entity_id,

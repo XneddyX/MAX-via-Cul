@@ -29,6 +29,9 @@ async def async_setup_entry(
     entities: list[SensorEntity] = []
     known_ids: set[str] = set()
 
+    # Global connection status sensor (one per integration, not per device)
+    entities.append(CulMaxConnectionStatusSensor(coordinator))
+
     for device in coordinator.get_all_devices():
         for entity in _build_diagnostic_entities(coordinator, device):
             entities.append(entity)
@@ -563,6 +566,51 @@ class CulMaxWeekProfileValidationSensor(SensorEntity):
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         return self._attrs
+
+
+class CulMaxConnectionStatusSensor(SensorEntity):
+    """Diagnostic sensor showing the TCP connection status to the CULFW device (MAX! Cube / CUNO)."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Connection"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_icon = "mdi:network"
+
+    def __init__(self, coordinator: CulMaxCoordinator) -> None:
+        self._coordinator = coordinator
+        self._attr_unique_id = (
+            f"{DOMAIN}__connection_{coordinator.host.replace('.', '_')}_{coordinator.port}"
+        )
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, f"controller_{coordinator.host}:{coordinator.port}")},
+            name=f"MAX! CUL ({coordinator.host}:{coordinator.port})",
+            manufacturer="eQ-3 / CULFW",
+            model="MAX! via CUL",
+        )
+        self._sync_from_coordinator()
+
+    def _sync_from_coordinator(self) -> None:
+        self._attr_native_value = "connected" if self._coordinator.is_connected else "disconnected"
+
+    async def async_added_to_hass(self) -> None:
+        self.async_on_remove(
+            self._coordinator.add_connection_listener(self._on_connection_update)
+        )
+
+    @callback
+    def _on_connection_update(self) -> None:
+        self._sync_from_coordinator()
+        self.async_write_ha_state()
+
+    @property
+    def extra_state_attributes(self) -> dict[str, object]:
+        return {
+            "host": self._coordinator.host,
+            "port": self._coordinator.port,
+            "is_connected": self._coordinator.is_connected,
+            "is_reconnecting": self._coordinator._reconnecting,
+            "reconnect_delay": self._coordinator._reconnect_delay,
+        }
 
 
 def _build_diagnostic_entities(

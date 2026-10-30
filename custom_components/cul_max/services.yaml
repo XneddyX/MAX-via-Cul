@@ -634,6 +634,28 @@ delete_virtual_device:
       selector:
         text:
 
+delete_device:
+  name: Gerät löschen
+  description: Löscht ein MAX!-Gerät (physisch oder virtuell) aus der Integration.
+  fields:
+    address:
+      name: Adresse
+      description: 6-stellige Hex-Adresse des Geräts (z.B. 1A2B3C)
+      selector:
+        text:
+    entity_id:
+      name: Geraet
+      description: Alternativ ein MAX!-Entity direkt auswählen
+      selector:
+        entity:
+          filter:
+            integration: cul_max
+    device_name:
+      name: Geraetename
+      description: Alternativ den gespeicherten MAX!-Geraetenamen angeben
+      selector:
+        text:
+
 send_virtual_shutter_contact_state:
   name: Virtuellen Fensterkontakt senden
   description: >
